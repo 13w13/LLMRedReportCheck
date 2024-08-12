@@ -7,3 +7,7 @@ langchain_community
 transformers
 torch
 chromadb
+openpyxl
+scikit-learn
+scipy
+openpyxl
