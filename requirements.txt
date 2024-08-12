@@ -1,0 +1,7 @@
+pandas
+numpy
+python-docx
+rank-bm25
+transformers
+torch
+gradio
