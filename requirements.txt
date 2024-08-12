@@ -14,3 +14,4 @@ openpyxl
 sentence-transformers
 tenacity
 unidecode
+huggingface_hub
