@@ -11,3 +11,6 @@ openpyxl
 scikit-learn
 scipy
 openpyxl
+sentence-transformers
+tenacity
+unidecode
