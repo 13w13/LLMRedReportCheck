@@ -29,7 +29,7 @@ if not HF_TOKEN:
 MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
 # Load indicators list
-INDICATORS_LIST = pd.read_csv('indicators_list.csv')
+INDICATORS_LIST = pd.read_csv('src/indicators_list.csv')
 
 def read_docx(file) -> str:
     try:
