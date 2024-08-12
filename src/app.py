@@ -1,14 +1,20 @@
+import gradio as gr
+import json
+from datetime import datetime
 import io
 import logging
 from typing import List
 import pandas as pd
 import numpy as np
 from docx import Document
-from rank_bm25 import BM25Okapi
-from transformers import pipeline
-import torch
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFaceEndpoint
+from langchain.memory import ConversationBufferMemory
 import os
-import gradio as gr
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -20,21 +26,15 @@ if not HF_TOKEN:
     raise ValueError("HUGGINGFACE_API_TOKEN not found in environment variables")
 
 # Llama model configuration
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
-llm = pipeline(
-    "text-generation",
-    model=MODEL_NAME,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    token=HF_TOKEN
-)
+MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
 # Load indicators list
 INDICATORS_LIST = pd.read_csv('indicators_list.csv')
 
 def read_docx(file) -> str:
     try:
-        doc = Document(io.BytesIO(file.read()))
+        content = file.read()
+        doc = Document(io.BytesIO(content))
         return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
         logger.error(f"Failed to read DOCX file: {file.name} - {e}")
@@ -42,52 +42,68 @@ def read_docx(file) -> str:
 
 def read_excel(file) -> pd.DataFrame:
     try:
-        return pd.read_excel(io.BytesIO(file.read()))
+        content = file.read()
+        return pd.read_excel(io.BytesIO(content))
     except Exception as e:
         logger.error(f"Failed to read Excel file: {file.name} - {e}")
         raise gr.Error(f"Excel file read failed: {str(e)}")
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = ' '.join(words[i:i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> List[str]:
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    return text_splitter.split_text(text)
 
-def hybrid_search(query: str, chunks: List[str], top_k: int = 5) -> List[str]:
-    tokenized_corpus = [chunk.split() for chunk in chunks]
-    bm25 = BM25Okapi(tokenized_corpus)
-    bm25_scores = bm25.get_scores(query.split())
-    
-    top_indices = np.argsort(bm25_scores)[-top_k:][::-1]
-    return [chunks[i] for i in top_indices]
+def create_db(splits):
+    embedding = HuggingFaceEmbeddings()
+    vectordb = Chroma.from_texts(
+        texts=splits,
+        embedding=embedding,
+    )
+    return vectordb
 
-def generate_llm_response(prompt: str) -> str:
-    response = llm(prompt, max_new_tokens=500, do_sample=True, temperature=0.7)
-    return response[0]['generated_text']
+def initialize_llm():
+    llm = HuggingFaceEndpoint(
+        repo_id=MODEL_NAME,
+        temperature=0.7,
+        max_new_tokens=500,
+        top_k=3,
+    )
+    return llm
 
 def generate_validation_questions(narrative_chunks: List[str], indicators: pd.DataFrame, ns_data: pd.DataFrame, financial_overview: pd.DataFrame, bilateral_support: pd.DataFrame):
+    llm = initialize_llm()
+    vectordb = create_db(narrative_chunks)
+    
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        output_key='answer',
+        return_messages=True
+    )
+    
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm,
+        retriever=vectordb.as_retriever(),
+        memory=memory,
+        return_source_documents=True,
+    )
+    
     all_questions = []
     
     for chunk in narrative_chunks:
-        relevant_data = hybrid_search(chunk, indicators.to_string() + ns_data.to_string() + financial_overview.to_string() + bilateral_support.to_string())
-        
         prompt = f"""
         You are an AI assistant specialized in validating Red Cross reports. Generate 1-2 detailed validation questions based on the following:
 
         Narrative Summary:
         {chunk}
 
-        Relevant Data:
-        {' '.join(relevant_data)}
-
         All Available Indicators:
         {INDICATORS_LIST.to_string()}
 
         For each question, provide:
         Country: Albania
-        Created: [Current date]
+        Created: {datetime.now().strftime('%Y-%m-%d')}
         Status: Open
         Section: [Relevant section from the data]
         Indicator: [Relevant indicator]
@@ -97,8 +113,8 @@ def generate_validation_questions(narrative_chunks: List[str], indicators: pd.Da
         Focus on inconsistencies, gaps, and adherence to Red Cross reporting standards.
         """
 
-        response = generate_llm_response(prompt)
-        all_questions.append(response)
+        response = qa_chain({"question": prompt})
+        all_questions.append(response['answer'])
 
     return "\n\n".join(all_questions)
 
@@ -141,7 +157,7 @@ def format_questions(validation_questions):
     return formatted_questions
 
 def export_json(formatted_questions):
-    questions = formatted_questions.split("Question")[1:]  # Skip the first empty split
+    questions = formatted_questions.split("Question")[1:]
     export_data = []
     for q in questions:
         lines = q.strip().split('\n')
@@ -156,7 +172,7 @@ def export_json(formatted_questions):
                 "question": lines[6].split(': ')[1]
             })
     
-    return export_data
+    return json.dumps(export_data, indent=2)
 
 # Define the Gradio interface
 with gr.Blocks(theme=gr.themes.Base()) as demo:
@@ -188,7 +204,6 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
         "narrative reports against numerical data, identifying inconsistencies "
         "and generating validation questions."
     )
-    gr.Markdown("Developed with ❤️ by Your Team | © 2023 LLM-RedReportCheck")
 
 # Launch the Gradio app
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
+gradio
 pandas
 numpy
 python-docx
-rank-bm25
+langchain
+langchain_community
 transformers
 torch
-gradio
+chromadb
