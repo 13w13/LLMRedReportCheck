@@ -12,7 +12,10 @@ import os
 import chromadb
 from pathlib import Path
 from unidecode import unidecode
-import spaces
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load the Llama 3.1 model
 MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
@@ -20,15 +23,14 @@ MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 # Get API token from environment variable
 HUGGINGFACEHUB_API_TOKEN = os.environ.get('HUGGINGFACEHUB_API_TOKEN')
 
-@spaces.GPU
 def load_indicators(file) -> Dict[str, Dict]:
     try:
-        df = pd.read_excel(file.name)
+        df = pd.read_excel(file.name, engine='openpyxl')
         return {str(row['KPI ID']): row.to_dict() for _, row in df.iterrows()}
     except Exception as e:
+        logging.error(f"Error loading indicators: {str(e)}")
         raise gr.Error(f"Error loading indicators: {str(e)}")
 
-@spaces.GPU
 def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
     try:
         doc = Document(file.name)
@@ -49,16 +51,16 @@ def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
         
         return full_text, page_mapping
     except Exception as e:
+        logging.error(f"Error extracting text from document: {str(e)}")
         raise gr.Error(f"Error extracting text from document: {str(e)}")
 
-@spaces.GPU
 def load_excel_data(files: List[gr.File]) -> Dict[str, pd.DataFrame]:
     try:
-        return {file.name.split('/')[-1].split('.')[0]: pd.read_excel(file.name) for file in files}
+        return {file.name.split('/')[-1].split('.')[0]: pd.read_excel(file.name, engine='openpyxl') for file in files}
     except Exception as e:
+        logging.error(f"Error loading Excel data: {str(e)}")
         raise gr.Error(f"Error loading Excel data: {str(e)}")
 
-@spaces.GPU
 def create_vector_db(text: str, collection_name: str) -> Chroma:
     try:
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -74,9 +76,9 @@ def create_vector_db(text: str, collection_name: str) -> Chroma:
         )
         return vectordb
     except Exception as e:
+        logging.error(f"Error creating vector database: {str(e)}")
         raise gr.Error(f"Error creating vector database: {str(e)}")
 
-@spaces.GPU
 def generate_validation_question(llm: HuggingFaceEndpoint, indicator: Dict, document_section: str, reported_value: str) -> str:
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are an AI assistant specialized in validating Red Cross reports. Analyze the following information and generate a detailed validation question.
@@ -102,7 +104,8 @@ Question: """
         response = llm(prompt)
         return response.strip()
     except Exception as e:
-        raise gr.Error(f"Error generating validation question: {str(e)}")
+        logging.error(f"Error generating validation question: {str(e)}")
+        return f"Error generating validation question: {str(e)}"
 
 def get_page_number(index: int, page_mapping: Dict[int, int]) -> int:
     for char_index, page in sorted(page_mapping.items(), reverse=True):
@@ -124,17 +127,22 @@ def create_collection_name(filepath):
         collection_name = collection_name[:-1] + 'Z'
     return collection_name
 
-@spaces.GPU
 def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str], progress=gr.Progress()) -> pd.DataFrame:
     progress(0, desc="Initializing...")
+    logging.info("Starting file processing")
+    
     # Initialize LLM
-    llm = HuggingFaceEndpoint(
-        repo_id=MODEL_NAME,
-        temperature=0.7,
-        max_new_tokens=150,
-        top_k=50,
-        huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-    )
+    try:
+        llm = HuggingFaceEndpoint(
+            repo_id=MODEL_NAME,
+            temperature=0.7,
+            max_new_tokens=150,
+            top_k=50,
+            huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
+        )
+    except Exception as e:
+        logging.error(f"Error initializing LLM: {str(e)}")
+        raise gr.Error(f"Error initializing LLM: {str(e)}")
 
     progress(0.1, desc="Loading indicators...")
     indicators = load_indicators(indicators_file)
@@ -153,6 +161,7 @@ def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files
 
     for section in selected_sections:
         if section not in excel_data:
+            logging.warning(f"Section {section} not found in Excel data")
             continue
         
         df = excel_data[section]
@@ -186,6 +195,7 @@ def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files
                             'Validation Question': validation_question
                         })
                 else:
+                    logging.warning(f"No similar chunks found for indicator {indicator['Indicator Name']}")
                     validation_question = generate_validation_question(llm, indicator, "Indicator not found in narrative", reported_value)
                     results.append({
                         'Section': section,
@@ -195,6 +205,8 @@ def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files
                         'Page Number': "N/A",
                         'Validation Question': validation_question
                     })
+            else:
+                logging.warning(f"Indicator ID {indicator_id} not found in indicators list")
         
         # Check for indicators in the narrative that are not reported
         for indicator_id, indicator in indicators.items():
@@ -218,8 +230,11 @@ def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files
                         'Page Number': page_number,
                         'Validation Question': validation_question
                     })
+                else:
+                    logging.warning(f"No similar chunks found for unreported indicator {indicator['Indicator Name']}")
     
     progress(1.0, desc="Completed!")
+    logging.info(f"Processing completed. Generated {len(results)} validation questions.")
     return pd.DataFrame(results)
 
 def demo():
