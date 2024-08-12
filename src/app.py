@@ -11,7 +11,7 @@ import os
 import gradio as gr
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Get Hugging Face token from environment variable
@@ -34,7 +34,7 @@ INDICATORS_LIST = pd.read_csv('indicators_list.csv')
 
 def read_docx(file) -> str:
     try:
-        doc = Document(file.name)
+        doc = Document(io.BytesIO(file.read()))
         return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
         logger.error(f"Failed to read DOCX file: {file.name} - {e}")
@@ -42,7 +42,7 @@ def read_docx(file) -> str:
 
 def read_excel(file) -> pd.DataFrame:
     try:
-        return pd.read_excel(file.name)
+        return pd.read_excel(io.BytesIO(file.read()))
     except Exception as e:
         logger.error(f"Failed to read Excel file: {file.name} - {e}")
         raise gr.Error(f"Excel file read failed: {str(e)}")
@@ -102,38 +102,94 @@ def generate_validation_questions(narrative_chunks: List[str], indicators: pd.Da
 
     return "\n\n".join(all_questions)
 
-def validate_data(narrative, indicators, ns_data, financial_overview, bilateral_support):
-    try:
-        narrative_text = read_docx(narrative)
-        narrative_chunks = chunk_text(narrative_text)
-        indicators_data = read_excel(indicators)
-        ns_data = read_excel(ns_data)
-        financial_overview = read_excel(financial_overview)
-        bilateral_support = read_excel(bilateral_support)
+def process_files(narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file):
+    if all([narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file]):
+        try:
+            narrative_text = read_docx(narrative_file)
+            narrative_chunks = chunk_text(narrative_text)
+            indicators_data = read_excel(indicators_file)
+            ns_data = read_excel(ns_data_file)
+            financial_overview = read_excel(financial_overview_file)
+            bilateral_support = read_excel(bilateral_support_file)
 
-        validation_questions = generate_validation_questions(
-            narrative_chunks, indicators_data, ns_data, financial_overview, bilateral_support
-        )
+            validation_questions = generate_validation_questions(
+                narrative_chunks, indicators_data, ns_data, financial_overview, bilateral_support
+            )
+            
+            formatted_questions = format_questions(validation_questions)
+            return formatted_questions
+        
+        except Exception as e:
+            return f"An error occurred: {str(e)}"
+    else:
+        return "Please upload all required files."
 
-        return validation_questions
-    except Exception as e:
-        logger.error(f"Error processing request: {e}")
-        return f"Validation process failed: {str(e)}"
+def format_questions(validation_questions):
+    formatted_questions = ""
+    questions = validation_questions.split('\n\n')
+    for i, q in enumerate(questions, 1):
+        formatted_questions += f"Question {i}:\n"
+        lines = q.split('\n')
+        if len(lines) >= 7:
+            formatted_questions += f"Country: {lines[0].split(': ')[1]}\n"
+            formatted_questions += f"Created: {lines[1].split(': ')[1]}\n"
+            formatted_questions += f"Status: {lines[2].split(': ')[1]}\n"
+            formatted_questions += f"Section: {lines[3].split(': ')[1]}\n"
+            formatted_questions += f"Indicator: {lines[4].split(': ')[1]}\n"
+            formatted_questions += f"Reported value: {lines[5].split(': ')[1]}\n"
+            formatted_questions += f"Question: {lines[6].split(': ')[1]}\n\n"
+    return formatted_questions
 
-# Gradio interface
-iface = gr.Interface(
-    fn=validate_data,
-    inputs=[
-        gr.File(label="Narrative (DOCX)"),
-        gr.File(label="Indicators (Excel)"),
-        gr.File(label="NS Data (Excel)"),
-        gr.File(label="Financial Overview (Excel)"),
-        gr.File(label="Bilateral Support (Excel)")
-    ],
-    outputs=gr.Textbox(label="Validation Questions"),
-    title="LLM-RedReportCheck",
-    description="Upload Red Cross report files to generate validation questions."
-)
+def export_json(formatted_questions):
+    questions = formatted_questions.split("Question")[1:]  # Skip the first empty split
+    export_data = []
+    for q in questions:
+        lines = q.strip().split('\n')
+        if len(lines) >= 7:
+            export_data.append({
+                "country": lines[0].split(': ')[1],
+                "created": lines[1].split(': ')[1],
+                "status": lines[2].split(': ')[1],
+                "section": lines[3].split(': ')[1],
+                "indicator": lines[4].split(': ')[1],
+                "reported_value": lines[5].split(': ')[1],
+                "question": lines[6].split(': ')[1]
+            })
+    
+    return export_data
 
+# Define the Gradio interface
+with gr.Blocks(theme=gr.themes.Base()) as demo:
+    gr.Markdown("# 🔍 LLM-RedReportCheck")
+    gr.Markdown("Upload narrative and data files to generate validation questions.")
+    
+    with gr.Row():
+        with gr.Column():
+            narrative_file = gr.File(label="Upload Narrative Report (DOCX)", file_types=[".docx"])
+            indicators_file = gr.File(label="Upload Indicators (XLSX)", file_types=[".xlsx"])
+            ns_data_file = gr.File(label="Upload National Society Data (XLSX)", file_types=[".xlsx"])
+        with gr.Column():
+            financial_overview_file = gr.File(label="Upload Financial Overview (XLSX)", file_types=[".xlsx"])
+            bilateral_support_file = gr.File(label="Upload Bilateral Support (XLSX)", file_types=[".xlsx"])
+    
+    questions_output = gr.Textbox(label="Validation Questions", lines=10)
+    
+    generate_btn = gr.Button("Generate Validation Questions")
+    generate_btn.click(fn=process_files, inputs=[narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file], outputs=questions_output)
+    
+    export_btn = gr.Button("Export Questions as JSON")
+    json_output = gr.JSON(label="Exported JSON")
+    export_btn.click(fn=export_json, inputs=questions_output, outputs=json_output)
+    
+    gr.Markdown("---")
+    gr.Markdown(
+        "LLM-RedReportCheck is an AI-powered tool designed to validate "
+        "humanitarian data reports. It uses Large Language Models to cross-check "
+        "narrative reports against numerical data, identifying inconsistencies "
+        "and generating validation questions."
+    )
+    gr.Markdown("Developed with ❤️ by Your Team | © 2023 LLM-RedReportCheck")
+
+# Launch the Gradio app
 if __name__ == "__main__":
-    iface.launch()
+    demo.launch()
