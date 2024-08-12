@@ -33,19 +33,33 @@ INDICATORS_LIST = pd.read_csv('src/indicators_list.csv')
 
 def read_docx(file) -> str:
     try:
-        content = file.read()
-        doc = Document(io.BytesIO(content))
+        if hasattr(file, 'name'):
+            # If it's a file-like object with a name attribute
+            doc = Document(file.name)
+        elif isinstance(file, str):
+            # If it's a file path
+            doc = Document(file)
+        else:
+            # If it's a bytes-like object
+            content = file.read() if hasattr(file, 'read') else file
+            doc = Document(io.BytesIO(content))
+        
         return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
-        logger.error(f"Failed to read DOCX file: {file.name} - {e}")
+        logger.error(f"Failed to read DOCX file: {getattr(file, 'name', str(file))} - {e}")
         raise gr.Error(f"DOCX file read failed: {str(e)}")
 
 def read_excel(file) -> pd.DataFrame:
     try:
-        content = file.read()
-        return pd.read_excel(io.BytesIO(content))
+        if hasattr(file, 'name'):
+            return pd.read_excel(file.name)
+        elif isinstance(file, str):
+            return pd.read_excel(file)
+        else:
+            content = file.read() if hasattr(file, 'read') else file
+            return pd.read_excel(io.BytesIO(content))
     except Exception as e:
-        logger.error(f"Failed to read Excel file: {file.name} - {e}")
+        logger.error(f"Failed to read Excel file: {getattr(file, 'name', str(file))} - {e}")
         raise gr.Error(f"Excel file read failed: {str(e)}")
 
 def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> List[str]:
