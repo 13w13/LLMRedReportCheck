@@ -1,6 +1,5 @@
 gradio
 pandas
-numpy
 python-docx
 langchain
 langchain_community
@@ -10,7 +9,6 @@ chromadb
 openpyxl
 scikit-learn
 scipy
-openpyxl
 sentence-transformers
 tenacity
 unidecode

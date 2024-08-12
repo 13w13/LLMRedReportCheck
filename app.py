@@ -1,276 +1,214 @@
 import gradio as gr
-import json
-from datetime import datetime
-import io
-import logging
-from typing import List
 import pandas as pd
-import numpy as np
 from docx import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
+import json
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms import HuggingFaceEndpoint
+from langchain_community.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
-from langchain.schema import Document as LangchainDocument
-import os
+from langchain_community.llms import HuggingFaceEndpoint
 import torch
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import time
-import random
-from pathlib import Path
-import chromadb
-from unidecode import unidecode
+from typing import List, Dict, Tuple
 import re
-from huggingface_hub import HfApi, HfHubHTTPError
+import os
+import chromadb
+from pathlib import Path
+from unidecode import unidecode
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Get Hugging Face token from environment variable
-HF_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("HUGGINGFACE_API_TOKEN not found in environment variables")
-
-# Llama model configuration
+# Load the Llama 3.1 model
 MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
-# Load indicators list
-INDICATORS_LIST = pd.read_csv('src/indicators_list.csv')
+def load_indicators(file) -> Dict[str, Dict]:
+    df = pd.read_excel(file.name)
+    return {str(row['KPI ID']): row.to_dict() for _, row in df.iterrows()}
 
-def read_docx(file) -> str:
-    try:
-        if hasattr(file, 'name'):
-            doc = Document(file.name)
-        elif isinstance(file, str):
-            doc = Document(file)
-        else:
-            content = file.read() if hasattr(file, 'read') else file
-            doc = Document(io.BytesIO(content))
+def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
+    doc = Document(file.name)
+    full_text = ""
+    page_mapping = {}
+    current_page = 1
+    words_on_page = 0
+    
+    for para in doc.paragraphs:
+        full_text += para.text + "\n"
+        words = len(para.text.split())
+        words_on_page += words
         
-        return "\n".join([para.text for para in doc.paragraphs])
-    except Exception as e:
-        logger.error(f"Failed to read DOCX file: {getattr(file, 'name', str(file))} - {e}")
-        raise gr.Error(f"DOCX file read failed: {str(e)}")
+        if words_on_page > 300:  # Approximate words per page
+            page_mapping[len(full_text)] = current_page
+            current_page += 1
+            words_on_page = 0
+    
+    return full_text, page_mapping
 
-def read_excel(file) -> pd.DataFrame:
-    try:
-        if hasattr(file, 'name'):
-            return pd.read_excel(file.name)
-        elif isinstance(file, str):
-            return pd.read_excel(file)
-        else:
-            content = file.read() if hasattr(file, 'read') else file
-            return pd.read_excel(io.BytesIO(content))
-    except Exception as e:
-        logger.error(f"Failed to read Excel file: {getattr(file, 'name', str(file))} - {e}")
-        raise gr.Error(f"Excel file read failed: {str(e)}")
+def load_excel_data(files: List[gr.File]) -> Dict[str, pd.DataFrame]:
+    return {file.name.split('/')[-1].split('.')[0]: pd.read_excel(file.name) for file in files}
 
-def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> List[str]:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
-    )
-    return text_splitter.split_text(text)
-
-def create_db(splits, collection_name):
+def create_vector_db(text: str, collection_name: str) -> Chroma:
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_text(text)
+    
     embedding = HuggingFaceEmbeddings()
     new_client = chromadb.EphemeralClient()
-    vectordb = Chroma.from_documents(
-        documents=splits,
+    vectordb = Chroma.from_texts(
+        texts=chunks,
         embedding=embedding,
         client=new_client,
-        collection_name=collection_name,
+        collection_name=collection_name
     )
     return vectordb
 
-def initialize_llm(temperature=0.7, max_tokens=500, top_k=3):
-    try:
-        llm = HuggingFaceEndpoint(
-            repo_id=MODEL_NAME,
-            temperature=temperature,
-            max_new_tokens=max_tokens,
-            top_k=top_k,
-        )
-        return llm
-    except Exception as e:
-        logger.error(f"Failed to initialize LLM: {str(e)}")
-        raise gr.Error(f"LLM initialization failed: {str(e)}")
+def generate_validation_question(llm: HuggingFaceEndpoint, indicator: Dict, document_section: str, reported_value: str) -> str:
+    prompt = f"""
+    You are an AI assistant specialized in validating Red Cross reports. Analyze the following information and generate a detailed validation question:
 
-def create_qa_chain(llm, vectordb):
-    try:
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            output_key='answer',
-            return_messages=True
-        )
-        
-        qa_chain = ConversationalRetrievalChain.from_llm(
-            llm,
-            retriever=vectordb.as_retriever(),
-            memory=memory,
-            return_source_documents=True,
-        )
-        return qa_chain
-    except Exception as e:
-        logger.error(f"Failed to create QA chain: {str(e)}")
-        raise gr.Error(f"QA chain creation failed: {str(e)}")
+    Indicator: {indicator['Indicator Name']}
+    Definition: {indicator['Definition']}
+    Reported Value: {reported_value}
+    Relevant Document Section:
+    {document_section[:1000]}  # Truncate to avoid exceeding token limit
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(HfHubHTTPError))
-def generate_question(qa_chain: ConversationalRetrievalChain, chunk: str, indicators: pd.DataFrame):
-    try:
-        prompt = f"""
-        You are an AI assistant specialized in validating Red Cross reports. Generate 1 detailed validation question based on the following:
+    Provide the question in this format:
+    Question: [Your validation question]
 
-        Narrative Summary:
-        {chunk}
+    Focus on the following aspects:
+    1. Inconsistencies between the reported value and the narrative
+    2. Gaps in information or missing details
+    3. Adherence to Red Cross reporting standards
+    4. Potential misreporting or misinterpretation
+    5. Suggestions for additional data or clarification needed
 
-        Indicator Information:
-        {indicators.head().to_string()}  # Only send a sample of indicators to reduce payload
-
-        Provide the question in this format:
-        Country: [Country name]
-        Created: {datetime.now().strftime('%Y-%m-%d')}
-        Status: Open
-        Section: [Relevant section from the data]
-        Indicator: [Relevant indicator]
-        Reported value: [Value from data or "Not Reported"]
-        Question: [Your validation question]
-
-        Focus on inconsistencies, gaps, and adherence to Red Cross reporting standards.
-        """
-
-        response = qa_chain({"question": prompt})
-        return response['answer']
-    except Exception as e:
-        logger.error(f"Failed to generate question: {str(e)}")
-        return f"Failed to generate question: {str(e)}"
-
-def process_files(narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file, chunk_size, chunk_overlap):
-    if all([narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file]):
-        try:
-            # Read and process narrative
-            narrative_text = read_docx(narrative_file)
-            narrative_chunks = chunk_text(narrative_text, chunk_size, chunk_overlap)
-            
-            # Create vector database from narrative chunks
-            narrative_docs = [LangchainDocument(page_content=chunk, metadata={"source": "narrative"}) for chunk in narrative_chunks]
-            vectordb = create_db(narrative_docs, "narrative_db")
-            
-            # Read other files
-            indicators_data = read_excel(indicators_file)
-            ns_data = read_excel(ns_data_file)
-            financial_overview = read_excel(financial_overview_file)
-            bilateral_support = read_excel(bilateral_support_file)
-            
-            # Initialize LLM and QA chain
-            llm = initialize_llm()
-            qa_chain = create_qa_chain(llm, vectordb)
-            
-            # Generate questions
-            all_questions = []
-            for i, chunk in enumerate(narrative_chunks):
-                try:
-                    question = generate_question(qa_chain, chunk, indicators_data)
-                    all_questions.append(question)
-                    time.sleep(random.uniform(1, 3))  # Add a random delay between API calls
-                except Exception as e:
-                    logger.error(f"Error generating question for chunk {i}: {e}")
-                    all_questions.append(f"Failed to generate question for chunk {i}: {str(e)}")
-            
-            formatted_questions = format_questions("\n\n".join(all_questions))
-            return formatted_questions
-        
-        except Exception as e:
-            logger.error(f"An error occurred: {str(e)}")
-            return f"An error occurred: {str(e)}"
-    else:
-        return "Please upload all required files."
-
-def format_questions(validation_questions):
-    formatted_questions = ""
-    questions = validation_questions.split('\n\n')
-    for i, q in enumerate(questions, 1):
-        formatted_questions += f"Question {i}:\n"
-        lines = q.split('\n')
-        if len(lines) >= 7:
-            formatted_questions += f"Country: {lines[0].split(': ')[1]}\n"
-            formatted_questions += f"Created: {lines[1].split(': ')[1]}\n"
-            formatted_questions += f"Status: {lines[2].split(': ')[1]}\n"
-            formatted_questions += f"Section: {lines[3].split(': ')[1]}\n"
-            formatted_questions += f"Indicator: {lines[4].split(': ')[1]}\n"
-            formatted_questions += f"Reported value: {lines[5].split(': ')[1]}\n"
-            formatted_questions += f"Question: {lines[6].split(': ')[1]}\n\n"
-    return formatted_questions
-
-def export_json(formatted_questions):
-    questions = formatted_questions.split("Question")[1:]
-    export_data = []
-    for q in questions:
-        lines = q.strip().split('\n')
-        if len(lines) >= 7:
-            export_data.append({
-                "country": lines[0].split(': ')[1],
-                "created": lines[1].split(': ')[1],
-                "status": lines[2].split(': ')[1],
-                "section": lines[3].split(': ')[1],
-                "indicator": lines[4].split(': ')[1],
-                "reported_value": lines[5].split(': ')[1],
-                "question": lines[6].split(': ')[1]
-            })
+    If there are no apparent issues, suggest a question to verify the accuracy and completeness of the reported information.
+    """
     
-    return json.dumps(export_data, indent=2)
+    response = llm(prompt)
+    return response.split("Question: ")[-1].strip()
 
-def create_demo():
-    with gr.Blocks(theme=gr.themes.Base()) as demo:
-        gr.Markdown("# 🔍 LLM-RedReportCheck")
-        gr.Markdown("Upload narrative and data files to generate validation questions.")
+def get_page_number(index: int, page_mapping: Dict[int, int]) -> int:
+    for char_index, page in sorted(page_mapping.items(), reverse=True):
+        if index >= char_index:
+            return page
+    return 1
+
+def create_collection_name(filepath):
+    collection_name = Path(filepath).stem
+    collection_name = collection_name.replace(" ","-") 
+    collection_name = unidecode(collection_name)
+    collection_name = re.sub('[^A-Za-z0-9]+', '-', collection_name)
+    collection_name = collection_name[:50]
+    if len(collection_name) < 3:
+        collection_name = collection_name + 'xyz'
+    if not collection_name[0].isalnum():
+        collection_name = 'A' + collection_name[1:]
+    if not collection_name[-1].isalnum():
+        collection_name = collection_name[:-1] + 'Z'
+    return collection_name
+
+def process_files(indicators_file: gr.File, narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str]) -> pd.DataFrame:
+    # Initialize LLM
+    llm = HuggingFaceEndpoint(
+        repo_id=MODEL_NAME,
+        temperature=0.7,
+        max_new_tokens=150,
+        top_k=50,
+    )
+
+    indicators = load_indicators(indicators_file)
+    narrative_text, page_mapping = extract_text_from_docx(narrative_file)
+    excel_data = load_excel_data(excel_files)
+    
+    collection_name = create_collection_name(narrative_file.name)
+    vectordb = create_vector_db(narrative_text, collection_name)
+    
+    results = []
+    for section in selected_sections:
+        if section not in excel_data:
+            continue
+        
+        df = excel_data[section]
+        
+        for _, row in df.iterrows():
+            indicator_id = str(row.get('KPI ID', ''))
+            if indicator_id in indicators:
+                indicator = indicators[indicator_id]
+                reported_value = row.get('Value', 'N/A')
+                
+                query = f"{indicator['Indicator Name']} {indicator['Definition']}"
+                similar_chunks = vectordb.similarity_search(query, k=2)
+                
+                if similar_chunks:
+                    for chunk in similar_chunks:
+                        source_text = chunk.page_content
+                        start_index = narrative_text.index(source_text)
+                        page_number = get_page_number(start_index, page_mapping)
+                        
+                        validation_question = generate_validation_question(llm, indicator, source_text, reported_value)
+                        
+                        results.append({
+                            'Section': section,
+                            'Indicator': indicator['Indicator Name'],
+                            'Reported Value': reported_value,
+                            'Source from Doc': source_text,
+                            'Page Number': page_number,
+                            'Validation Question': validation_question
+                        })
+                else:
+                    validation_question = generate_validation_question(llm, indicator, "Indicator not found in narrative", reported_value)
+                    results.append({
+                        'Section': section,
+                        'Indicator': indicator['Indicator Name'],
+                        'Reported Value': reported_value,
+                        'Source from Doc': "Indicator not found in narrative",
+                        'Page Number': "N/A",
+                        'Validation Question': validation_question
+                    })
+        
+        # Check for indicators in the narrative that are not reported
+        for indicator_id, indicator in indicators.items():
+            if indicator_id not in df['KPI ID'].astype(str).values:
+                query = f"{indicator['Indicator Name']} {indicator['Definition']}"
+                similar_chunks = vectordb.similarity_search(query, k=1)
+                
+                if similar_chunks:
+                    chunk = similar_chunks[0]
+                    source_text = chunk.page_content
+                    start_index = narrative_text.index(source_text)
+                    page_number = get_page_number(start_index, page_mapping)
+                    
+                    validation_question = generate_validation_question(llm, indicator, source_text, "Not Reported")
+                    
+                    results.append({
+                        'Section': section,
+                        'Indicator': indicator['Indicator Name'],
+                        'Reported Value': 'Not Reported',
+                        'Source from Doc': source_text,
+                        'Page Number': page_number,
+                        'Validation Question': validation_question
+                    })
+    
+    return pd.DataFrame(results)
+
+def demo():
+    with gr.Blocks(theme="base") as demo:
+        gr.Markdown("# Red Cross Report Validator")
+        gr.Markdown("Upload files and select sections to generate validation questions.")
         
         with gr.Row():
-            with gr.Column():
-                narrative_file = gr.File(label="Upload Narrative Report (DOCX)", file_types=[".docx"])
-                indicators_file = gr.File(label="Upload Indicators (XLSX)", file_types=[".xlsx"])
-                ns_data_file = gr.File(label="Upload National Society Data (XLSX)", file_types=[".xlsx"])
-            with gr.Column():
-                financial_overview_file = gr.File(label="Upload Financial Overview (XLSX)", file_types=[".xlsx"])
-                bilateral_support_file = gr.File(label="Upload Bilateral Support (XLSX)", file_types=[".xlsx"])
+            indicators_file = gr.File(label="Indicators List (Excel)")
+            narrative_file = gr.File(label="Narrative Document (Word)")
+            excel_files = gr.File(label="Excel Files", file_count="multiple")
         
-        with gr.Accordion("Advanced options", open=False):
-            chunk_size = gr.Slider(minimum=100, maximum=1000, value=250, step=50, label="Chunk size")
-            chunk_overlap = gr.Slider(minimum=10, maximum=200, value=50, step=10, label="Chunk overlap")
+        sections = gr.CheckboxGroup(choices=["NS Data", "Indicators", "Finance", "Support"], label="Select Sections")
         
-        questions_output = gr.Textbox(label="Validation Questions", lines=10)
+        submit_btn = gr.Button("Generate Validation Questions")
         
-        generate_btn = gr.Button("Generate Validation Questions")
-        generate_btn.click(fn=process_files, inputs=[narrative_file, indicators_file, ns_data_file, financial_overview_file, bilateral_support_file, chunk_size, chunk_overlap], outputs=questions_output)
+        output = gr.DataFrame(label="Validation Results")
         
-        export_btn = gr.Button("Export Questions as JSON")
-        json_output = gr.JSON(label="Exported JSON")
-        export_btn.click(fn=export_json, inputs=questions_output, outputs=json_output)
-        
-        gr.Markdown("---")
-        gr.Markdown(
-            "LLM-RedReportCheck is an AI-powered tool designed to validate "
-            "humanitarian data reports. It uses Large Language Models to cross-check "
-            "narrative reports against numerical data, identifying inconsistencies "
-            "and generating validation questions."
-        )
+        submit_btn.click(process_files, inputs=[indicators_file, narrative_file, excel_files, sections], outputs=output)
     
     return demo
 
 if __name__ == "__main__":
-    # Configuration
-    LOCAL_DEBUG = False  # Set to False when deploying to Hugging Face Spaces
-    PORT = 7860  # Choose any available port
-
-    # Create the Gradio demo
-    demo = create_demo()
-
-    if LOCAL_DEBUG:
-        # Run locally
-        demo.launch(server_port=PORT, share=False)
-    else:
-        # Deploy to Hugging Face Spaces
-        demo.launch()
+    demo().launch()
