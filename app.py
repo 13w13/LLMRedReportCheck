@@ -20,7 +20,7 @@ import torch
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load the model (you can change this to other models as needed)
-MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
 def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
     doc = Document(file.name)
