@@ -4,7 +4,7 @@ from docx import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.llms import HuggingFaceEndpoint
+from langchain_community.llms import HuggingFacePipeline
 from typing import List, Dict, Tuple
 import re
 import os
@@ -13,15 +13,14 @@ from pathlib import Path
 from unidecode import unidecode
 import logging
 import spaces
+from transformers import AutoTokenizer, pipeline
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load the Llama 3.1 model
-MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
-
-# Get API token from environment variable
-HUGGINGFACEHUB_API_TOKEN = os.getenv('HUGGINGFACEHUB_API_TOKEN')
+# Load the model (you can change this to other models as needed)
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
 
 def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
     doc = Document(file.name)
@@ -61,9 +60,27 @@ def create_vector_db(text: str, collection_name: str) -> Chroma:
     return vectordb
 
 @spaces.GPU
-def generate_validation_question(llm: HuggingFaceEndpoint, indicator: str, document_section: str, reported_value: str) -> str:
-    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are an AI assistant specialized in validating Red Cross reports. Analyze the following information and generate a detailed validation question.
+def initialize_llm(temperature: float = 0.7, max_new_tokens: int = 1024, top_k: int = 50) -> HuggingFacePipeline:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    pipe = pipeline(
+        "text-generation",
+        model=MODEL_NAME,
+        tokenizer=tokenizer,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        top_k=top_k,
+        num_return_sequences=1,
+        eos_token_id=tokenizer.eos_token_id
+    )
+    llm = HuggingFacePipeline(pipeline=pipe, model_kwargs={'temperature': temperature})
+    return llm
+
+@spaces.GPU
+def generate_validation_question(llm: HuggingFacePipeline, indicator: str, document_section: str, reported_value: str) -> str:
+    prompt = f"""<s>[INST] You are an AI assistant specialized in validating Red Cross reports. Analyze the following information and generate a detailed validation question.
 
 Indicator: {indicator}
 Reported Value: {reported_value}
@@ -77,12 +94,12 @@ Focus on the following aspects:
 4. Potential misreporting or misinterpretation
 5. Suggestions for additional data or clarification needed
 
-If there are no apparent issues, suggest a question to verify the accuracy and completeness of the reported information.<|eot_id|><|start_header_id|>user<|end_header_id|>
-Generate a validation question based on the provided information.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-Question: """
+If there are no apparent issues, suggest a question to verify the accuracy and completeness of the reported information.
+
+Generate a validation question based on the provided information. [/INST]"""
     
     response = llm(prompt)
-    return response.strip()
+    return response[0]['generated_text'].strip()
 
 def get_page_number(index: int, page_mapping: Dict[int, int]) -> int:
     for char_index, page in sorted(page_mapping.items(), reverse=True):
@@ -105,15 +122,9 @@ def create_collection_name(filepath):
     return collection_name
 
 @spaces.GPU(duration=300)  # Set a higher duration if needed
-def process_files(narrative_file: gr.File, ns_data_file: gr.File, indicators_file: gr.File, finance_file: gr.File, support_file: gr.File) -> str:
+def process_files(narrative_file: gr.File, ns_data_file: gr.File, indicators_file: gr.File, finance_file: gr.File, support_file: gr.File, temperature: float, max_new_tokens: int, top_k: int) -> str:
     logging.info("Starting process_files function")
-    llm = HuggingFaceEndpoint(
-        repo_id=MODEL_NAME,
-        temperature=0.7,
-        max_new_tokens=150,
-        top_k=50,
-        huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-    )
+    llm = initialize_llm(temperature, max_new_tokens, top_k)
 
     narrative_text, page_mapping = extract_text_from_docx(narrative_file)
     
@@ -212,6 +223,9 @@ demo = gr.Interface(
         gr.File(label="Indicators Excel File"),
         gr.File(label="Finance Excel File"),
         gr.File(label="Support Excel File"),
+        gr.Slider(minimum=0.1, maximum=1.0, value=0.7, step=0.1, label="Temperature"),
+        gr.Slider(minimum=256, maximum=2048, value=1024, step=64, label="Max New Tokens"),
+        gr.Slider(minimum=1, maximum=100, value=50, step=1, label="Top K"),
     ],
     outputs=gr.Textbox(label="Validation Results", lines=20),
     title="Red Cross Report Validator",
