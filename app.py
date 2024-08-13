@@ -1,5 +1,4 @@
 import gradio as gr
-from transformers import pipeline
 import pandas as pd
 from docx import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -13,6 +12,7 @@ import chromadb
 from pathlib import Path
 from unidecode import unidecode
 import logging
+import spaces
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,11 +45,12 @@ def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
 def load_excel_data(files: List[gr.File]) -> Dict[str, pd.DataFrame]:
     return {file.name.split('/')[-1].split('.')[0]: pd.read_excel(file.name, engine='openpyxl') for file in files}
 
+@spaces.GPU
 def create_vector_db(text: str, collection_name: str) -> Chroma:
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_text(text)
     
-    embedding = HuggingFaceEmbeddings()
+    embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     new_client = chromadb.EphemeralClient()
     vectordb = Chroma.from_texts(
         texts=chunks,
@@ -59,6 +60,7 @@ def create_vector_db(text: str, collection_name: str) -> Chroma:
     )
     return vectordb
 
+@spaces.GPU
 def generate_validation_question(llm: HuggingFaceEndpoint, indicator: str, document_section: str, reported_value: str) -> str:
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are an AI assistant specialized in validating Red Cross reports. Analyze the following information and generate a detailed validation question.
@@ -102,9 +104,8 @@ def create_collection_name(filepath):
         collection_name = collection_name[:-1] + 'Z'
     return collection_name
 
-def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str], progress=gr.Progress()) -> str:
-    progress(0, desc="Initializing...")
-    
+@spaces.GPU(duration=300)  # Set a higher duration if needed
+def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str]) -> str:
     llm = HuggingFaceEndpoint(
         repo_id=MODEL_NAME,
         temperature=0.7,
@@ -113,18 +114,13 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
         huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
     )
 
-    progress(0.2, desc="Extracting narrative...")
     narrative_text, page_mapping = extract_text_from_docx(narrative_file)
-    progress(0.3, desc="Loading Excel data...")
     excel_data = load_excel_data(excel_files)
     
-    progress(0.4, desc="Creating vector database...")
     collection_name = create_collection_name(narrative_file.name)
     vectordb = create_vector_db(narrative_text, collection_name)
     
     results = []
-    total_steps = sum(len(excel_data[section]) for section in selected_sections if section in excel_data)
-    current_step = 0
 
     for section in selected_sections:
         if section not in excel_data:
@@ -133,9 +129,6 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
         df = excel_data[section]
         
         for _, row in df.iterrows():
-            current_step += 1
-            progress(0.4 + (0.6 * current_step / total_steps), desc=f"Processing {section} - {current_step}/{total_steps}")
-            
             indicator = row.get('Indicator Name', 'Unknown Indicator')
             reported_value = row.get('Value', 'N/A')
             
@@ -169,8 +162,6 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
                     'Validation Question': validation_question
                 })
     
-    progress(1.0, desc="Completed!")
-    
     results_str = "Validation Results:\n\n"
     for result in results:
         results_str += f"Section: {result['Section']}\n"
@@ -182,21 +173,17 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
     
     return results_str
 
-with gr.Blocks(theme=gr.themes.Base()) as demo:
-    gr.Markdown("# Red Cross Report Validator")
-    gr.Markdown("Upload files and select sections to generate validation questions.")
-    
-    with gr.Row():
-        narrative_file = gr.File(label="Narrative Document (Word)")
-        excel_files = gr.File(label="Excel Files", file_count="multiple")
-    
-    sections = gr.CheckboxGroup(choices=["NS Data", "Indicators", "Finance", "Support"], label="Select Sections")
-    
-    submit_btn = gr.Button("Generate Validation Questions")
-    
-    output = gr.Textbox(label="Validation Results", lines=20)
-    
-    submit_btn.click(process_files, inputs=[narrative_file, excel_files, sections], outputs=output)
+demo = gr.Interface(
+    fn=process_files,
+    inputs=[
+        gr.File(label="Narrative Document (Word)"),
+        gr.File(label="Excel Files", file_count="multiple"),
+        gr.CheckboxGroup(choices=["NS Data", "Indicators", "Finance", "Support"], label="Select Sections")
+    ],
+    outputs=gr.Textbox(label="Validation Results", lines=20),
+    title="Red Cross Report Validator",
+    description="Upload files and select sections to generate validation questions."
+)
 
 if __name__ == "__main__":
     demo.launch()
