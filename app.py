@@ -106,6 +106,7 @@ def create_collection_name(filepath):
 
 @spaces.GPU(duration=300)  # Set a higher duration if needed
 def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str]) -> str:
+    logging.info("Starting process_files function")
     llm = HuggingFaceEndpoint(
         repo_id=MODEL_NAME,
         temperature=0.7,
@@ -124,6 +125,7 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
 
     for section in selected_sections:
         if section not in excel_data:
+            logging.warning(f"Section {section} not found in excel data")
             continue
         
         df = excel_data[section]
@@ -152,6 +154,7 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
                         'Validation Question': validation_question
                     })
             else:
+                logging.warning(f"No similar chunks found for indicator: {indicator}")
                 validation_question = generate_validation_question(llm, indicator, "Indicator not found in narrative", reported_value)
                 results.append({
                     'Section': section,
@@ -171,6 +174,7 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
         results_str += f"Page Number: {result['Page Number']}\n"
         results_str += f"Validation Question: {result['Validation Question']}\n\n"
     
+    logging.info(f"Generated results: {results_str[:500]}...")  # Log first 500 characters of results
     return results_str
 
 demo = gr.Interface(
