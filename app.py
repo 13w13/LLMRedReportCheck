@@ -42,8 +42,8 @@ def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
     
     return full_text, page_mapping
 
-def load_excel_data(files: List[gr.File]) -> Dict[str, pd.DataFrame]:
-    return {file.name.split('/')[-1].split('.')[0]: pd.read_excel(file.name, engine='openpyxl') for file in files}
+def load_excel_data(file: gr.File) -> pd.DataFrame:
+    return pd.read_excel(file.name, engine='openpyxl')
 
 @spaces.GPU
 def create_vector_db(text: str, collection_name: str) -> Chroma:
@@ -105,7 +105,7 @@ def create_collection_name(filepath):
     return collection_name
 
 @spaces.GPU(duration=300)  # Set a higher duration if needed
-def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_sections: List[str]) -> str:
+def process_files(narrative_file: gr.File, ns_data_file: gr.File, indicators_file: gr.File, finance_file: gr.File, support_file: gr.File) -> str:
     logging.info("Starting process_files function")
     llm = HuggingFaceEndpoint(
         repo_id=MODEL_NAME,
@@ -116,54 +116,81 @@ def process_files(narrative_file: gr.File, excel_files: List[gr.File], selected_
     )
 
     narrative_text, page_mapping = extract_text_from_docx(narrative_file)
-    excel_data = load_excel_data(excel_files)
+    
+    excel_data = {
+        "NS Data": load_excel_data(ns_data_file) if ns_data_file else None,
+        "Indicators": load_excel_data(indicators_file) if indicators_file else None,
+        "Finance": load_excel_data(finance_file) if finance_file else None,
+        "Support": load_excel_data(support_file) if support_file else None
+    }
     
     collection_name = create_collection_name(narrative_file.name)
     vectordb = create_vector_db(narrative_text, collection_name)
     
     results = []
 
-    for section in selected_sections:
-        if section not in excel_data:
-            logging.warning(f"Section {section} not found in excel data")
+    for section, df in excel_data.items():
+        if df is None:
+            logging.warning(f"Section {section} not provided")
             continue
         
-        df = excel_data[section]
-        
-        for _, row in df.iterrows():
-            indicator = row.get('Indicator Name', 'Unknown Indicator')
-            reported_value = row.get('Value', 'N/A')
-            
-            query = indicator
-            similar_chunks = vectordb.similarity_search(query, k=2)
-            
-            if similar_chunks:
-                for chunk in similar_chunks:
-                    source_text = chunk.page_content
-                    start_index = narrative_text.index(source_text)
-                    page_number = get_page_number(start_index, page_mapping)
-                    
-                    validation_question = generate_validation_question(llm, indicator, source_text, reported_value)
-                    
+        if section == "Indicators":
+            for _, row in df.iterrows():
+                indicator = row.get('Indicator', 'Unknown Indicator')
+                reported_value = row.get('2024 Midyear', 'N/A')
+                
+                query = indicator
+                similar_chunks = vectordb.similarity_search(query, k=2)
+                
+                if similar_chunks:
+                    for chunk in similar_chunks:
+                        source_text = chunk.page_content
+                        start_index = narrative_text.index(source_text)
+                        page_number = get_page_number(start_index, page_mapping)
+                        
+                        validation_question = generate_validation_question(llm, indicator, source_text, reported_value)
+                        
+                        results.append({
+                            'Section': section,
+                            'Indicator': indicator,
+                            'Reported Value': reported_value,
+                            'Source from Doc': source_text,
+                            'Page Number': page_number,
+                            'Validation Question': validation_question
+                        })
+                else:
+                    logging.warning(f"No similar chunks found for indicator: {indicator}")
+                    validation_question = generate_validation_question(llm, indicator, "Indicator not found in narrative", reported_value)
                     results.append({
                         'Section': section,
                         'Indicator': indicator,
                         'Reported Value': reported_value,
-                        'Source from Doc': source_text,
-                        'Page Number': page_number,
+                        'Source from Doc': "Indicator not found in narrative",
+                        'Page Number': "N/A",
                         'Validation Question': validation_question
                     })
-            else:
-                logging.warning(f"No similar chunks found for indicator: {indicator}")
-                validation_question = generate_validation_question(llm, indicator, "Indicator not found in narrative", reported_value)
+        elif section == "Support":
+            for _, row in df.iterrows():
+                national_society = row.get('National Society name', 'Unknown NS')
+                sp1_status = row.get('SP1 - Climate and enviroment', 'N/A')
+                sp2_status = row.get('SP2 - Disasters and crises', 'N/A')
+                sp3_status = row.get('SP3 - Health and wellbeing', 'N/A')
+                
+                validation_question = generate_validation_question(llm, f"Support status for {national_society}", 
+                                                                   f"SP1: {sp1_status}, SP2: {sp2_status}, SP3: {sp3_status}", 
+                                                                   "N/A")
+                
                 results.append({
                     'Section': section,
-                    'Indicator': indicator,
-                    'Reported Value': reported_value,
-                    'Source from Doc': "Indicator not found in narrative",
+                    'Indicator': f"Support status for {national_society}",
+                    'Reported Value': f"SP1: {sp1_status}, SP2: {sp2_status}, SP3: {sp3_status}",
+                    'Source from Doc': "Support data",
                     'Page Number': "N/A",
                     'Validation Question': validation_question
                 })
+        else:
+            # Handle NS Data and Finance sections if needed
+            pass
     
     results_str = "Validation Results:\n\n"
     for result in results:
@@ -181,12 +208,14 @@ demo = gr.Interface(
     fn=process_files,
     inputs=[
         gr.File(label="Narrative Document (Word)"),
-        gr.File(label="Excel Files", file_count="multiple"),
-        gr.CheckboxGroup(choices=["NS Data", "Indicators", "Finance", "Support"], label="Select Sections")
+        gr.File(label="NS Data Excel File"),
+        gr.File(label="Indicators Excel File"),
+        gr.File(label="Finance Excel File"),
+        gr.File(label="Support Excel File"),
     ],
     outputs=gr.Textbox(label="Validation Results", lines=20),
     title="Red Cross Report Validator",
-    description="Upload files and select sections to generate validation questions."
+    description="Upload files to generate validation questions."
 )
 
 if __name__ == "__main__":
