@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 MODEL_NAME = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
 # Get API token from environment variable
-HUGGINGFACEHUB_API_TOKEN = os.environ.get('HUGGINGFACEHUB_API_TOKEN')
+HUGGINGFACEHUB_API_TOKEN = os.getenv('HUGGINGFACEHUB_API_TOKEN')
 
 def extract_text_from_docx(file) -> Tuple[str, Dict[int, int]]:
     doc = Document(file.name)
